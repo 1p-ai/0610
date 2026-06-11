@@ -1,128 +1,117 @@
-
-from dotenv import load_dotenv
-load_dotenv()
-
-import streamlit as st
 import os
-import tempfile
+import streamlit as st
+from dotenv import load_dotenv
 import pypdf
-
-# 문서 분할기
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-# Vector DB
-from langchain_chroma import Chroma
-
-# LangChain 모델 및 코어
 from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
-from langchain_openai import ChatOpenAI
 
-
-# LangChain Expression Language (LCEL) 및 파서
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
-st.title("PDF File Reader")
-st.write("---")
+# .env 파일에서 환경 변수 로드
+load_dotenv()
 
-# PDF 업로드 영역
-uploaded_file = st.file_uploader( "PDF 파일을 업로드하세요",  type=["pdf"] )
-st.write("---")
+st.set_page_config(page_title="📄 PDF 파일 분석기", page_icon="📄", layout="wide")
+st.title("📄 PDF 파일 분석 및 Q&A")
+st.markdown("---")
 
+# --- 함수 및 클래스 정의 ---
 
-# ==========================================================
-# PDF → Document 변환 함수
-# ==========================================================
-def pdf_to_documents(uploaded_file):
-    """
-    업로드된 PDF 파일을 메모리에서 직접 읽어 pypdf를 사용해
-    LangChain Document 리스트(페이지별) 형태로 변환합니다.
+@st.cache_resource(show_spinner="PDF를 분석하여 벡터 데이터로 변환 중입니다...")
+def create_retriever(_uploaded_file, _openai_api_key):
+    """업로드된 PDF 파일을 처리하여 LangChain 리트리버를 생성하고 캐시에 저장합니다."""
+    if not _uploaded_file:
+        return None
 
-    처리 과정:
-    1. pypdf로 업로드된 파일의 바이트 스트림을 직접 읽기
-    2. 페이지별로 텍스트를 추출하여 Document 객체 생성
+    # pypdf를 사용하여 메모리에서 직접 PDF 처리
+    pdf_reader = pypdf.PdfReader(_uploaded_file)
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text() or ""
 
-    return:
-        pages (list[langchain_core.documents.Document])
-    """
-    pdf_reader = pypdf.PdfReader(uploaded_file)
-    docs = []
-    for i, page in enumerate(pdf_reader.pages):
-        text = page.extract_text()
-        if text:
-            docs.append(Document(page_content=text, metadata={'source': uploaded_file.name, 'page': i + 1}))
-    return docs
+    # Document 객체 생성
+    docs = [Document(page_content=text, metadata={"source": _uploaded_file.name})]
 
+    # 텍스트 분할
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    texts = text_splitter.split_documents(docs)
 
-if uploaded_file is not None:
-    pages = pdf_to_documents(uploaded_file)
-    st.success(  f"PDF 로딩 완료 : {len(pages)} 페이지"   )
+    # 임베딩 및 벡터 DB 생성 (Chroma)
+    embeddings = OpenAIEmbeddings(api_key=_openai_api_key)
+    db = Chroma.from_documents(documents=texts, embedding=embeddings)
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        # 한 조각의 최대 글자 수
-        chunk_size=1000,
+    # 리트리버 생성
+    retriever = db.as_retriever(search_kwargs={"k": 3})
+    return retriever
 
-        # 앞뒤 중복 문자, 문맥 유지를 위해 사용
-        chunk_overlap=200
-    )
+def format_docs(docs):
+    """검색된 문서들을 프롬프트에 맞게 포맷합니다."""
+    return "\n\n".join(doc.page_content for doc in docs)
 
+# --- 메인 앱 로직 ---
 
-    # Document 분할
-    texts = text_splitter.split_documents(  pages   )
+# 1. API 키 확인
+if "OPENAI_API_KEY" not in os.environ:
+    st.error("API 키가 없습니다. .env 파일에 OPENAI_API_KEY를 설정해주세요.")
+    st.stop()
+openai_api_key = os.environ["OPENAI_API_KEY"]
 
-    st.info(  f"문서 조각 개수 : {len(texts)}"   )
+# 2. 파일 업로더
+uploaded_file = st.file_uploader("분석할 PDF 파일을 업로드하세요.", type=["pdf"])
 
-    # -------------------------------
-    # 3. Embedding 생성
-    # -------------------------------
-    embeddings = OpenAIEmbeddings()
-    # -------------------------------
-    # 4. Vector Database 생성
-    # -------------------------------
-    db = Chroma.from_documents(  documents=texts,  embedding=embeddings   )
+# 3. 세션 상태 초기화
+if "pdf_messages" not in st.session_state:
+    st.session_state.pdf_messages = []
 
-    # -------------------------------
-    # 5. Retriever 생성
-    # -------------------------------
-    retriever = db.as_retriever(  search_kwargs={   "k": 3   }   )
+# 파일이 업로드되지 않았거나, 다른 파일로 교체되면 대화 기록 초기화
+if "last_uploaded_file" not in st.session_state or st.session_state.last_uploaded_file != uploaded_file:
+    st.session_state.last_uploaded_file = uploaded_file
+    st.session_state.pdf_messages = []
 
-    # ======================================================
-    # 질문 입력
-    # ======================================================
-    st.header( "PDF에게 질문하세요"    )
-    question = st.text_input( "질문 입력"   )
+if uploaded_file:
+    # 4. 리트리버 생성 (캐시된 결과 사용)
+    retriever = create_retriever(uploaded_file, openai_api_key)
 
-    if st.button("질문하기"):
-        if question.strip()=="":
-            st.warning(  "질문을 입력해주세요"     )
+    # 5. 대화 기록 표시
+    for message in st.session_state.pdf_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-        else:
-            with st.spinner( "AI가 답변 생성중..."   ):
+    # 6. 사용자 질문 입력
+    if question := st.chat_input("PDF 내용에 대해 질문해보세요!"):
+        st.session_state.pdf_messages.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
 
-                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        # 7. RAG 체인 실행 및 답변 생성
+        with st.chat_message("assistant"):
+            llm = ChatOpenAI(
+                model="gpt-4o-mini",
+                temperature=0,
+                streaming=True,
+                api_key=openai_api_key,
+            )
 
-                prompt = ChatPromptTemplate.from_template(
-                    """
-                    당신은 PDF 문서 분석 전문가입니다.
+            prompt = ChatPromptTemplate.from_template(
+                "당신은 PDF 문서에 대해 답변하는 AI 어시스턴트입니다. 주어진 문맥(Context)만을 사용하여 질문에 답변해주세요.\n\n"
+                "Context:\n{context}\n\n"
+                "Question: {input}\n\n"
+                "답변:"
+            )
 
-                    아래 Context 내용을 참고하여
-                    질문에 답변하세요.
+            # LCEL을 사용한 RAG 체인 구성
+            rag_chain = (
+                {"context": retriever | format_docs, "input": RunnablePassthrough()}
+                | prompt
+                | llm
+                | StrOutputParser()
+            )
 
-                    Context: {context}
-                    Question: {input}
-                    """
-                )
-
-                def format_docs(docs):
-                    return "\n\n".join(doc.page_content for doc in docs)
-
-                rag_chain = (
-                    {"context": retriever | format_docs, "input": RunnablePassthrough()}
-                    | prompt
-                    | llm
-                    | StrOutputParser()
-                )
-                answer = rag_chain.invoke(question)
-                st.write(answer)
+            # 스트리밍 방식으로 답변 출력
+            response = st.write_stream(rag_chain.stream(question))
+            st.session_state.pdf_messages.append({"role": "assistant", "content": response})
+else:
+    st.info("PDF 파일을 업로드하면 분석 및 질문이 시작됩니다.")
