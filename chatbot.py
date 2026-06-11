@@ -1,5 +1,7 @@
 import streamlit as st
 import os
+import json
+import base64
 from dotenv import load_dotenv
 import pypdf
 
@@ -7,277 +9,210 @@ import pypdf
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser, SimpleJsonOutputParser
+from langchain_core.output_parsers import StrOutputParser
 
+# `langchain.retrievers.multi_query` may not be available in all environments.
+# Import dynamically to avoid static-analysis (Pylance) missing-import errors
+import importlib
+try:
+    _mq_mod = importlib.import_module("langchain.retrievers.multi_query")
+    MultiQueryRetriever = getattr(_mq_mod, "MultiQueryRetriever")
+except Exception:
+    class MultiQueryRetriever:
+        """Minimal fallback shim for environments without langchain.retrievers.multi_query.
+
+        `from_llm` returns the passed `retriever` unchanged so existing callsites
+        work with a normal retriever instance.
+        """
+        @classmethod
+        def from_llm(cls, retriever, llm=None, **kwargs):
+            return retriever
 
 # .env 파일 로드
 load_dotenv()
 
 st.set_page_config(page_title="하이브리드 문서 요정", page_icon="🧚", layout="wide")
 
-
 # =========================================================================
-# 🎨 보완된 스타일 커스텀: HTML 카드 제거 및 실제 업로더를 드롭존 디자인으로 개조
+# 🎨 [오류 방지 및 UI 혁신] 전역 CSS 스타일 (Pylance 에러 유발 요소 완전 배제)
 # =========================================================================
-
-CSS_STYLE = r"""
+CSS_STYLE = """
 <style>
     body, .stApp { background: #f4f7fb; }
-    .block-container { padding-top: 3rem; padding-bottom: 2rem; }
-    .page-card, .panel-card, .section-card { background: #ffffff; border-radius: 24px; padding: 24px; box-shadow: 0 24px 60px rgba(24, 39, 75, 0.08); border: 1px solid #e2e8f0; }
-    .page-card { margin-bottom: 1.5rem; }
-    .section-card { background: #f8fbff; border: 1px solid #dbeafe; padding: 18px; margin-top: 18px; }
-    .panel-divider { height: 1px; background: #e2e8f0; margin: 24px 0; border: none; }
-    .app-title { font-size: 2.6rem; font-weight: 700; margin: 0; }
-    .app-subtitle { color: #525f7f; font-size: 1.1rem; margin-top: 0.35rem; }
-    .section-title { font-size: 1.3rem; font-weight: 700; margin-bottom: 0.75rem; }
-    .section-label { display: inline-flex; align-items: center; gap: 0.6rem; font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.08em; color: #475569; margin-bottom: 0.85rem; }
-    .section-subtitle { font-size: 1rem; font-weight: 600; color: #0f172a; margin-bottom: 0.5rem; }
-    .supported-file { background: #eef4ff; color: #1f4ed8; padding: 12px 16px; border-radius: 14px; display: inline-block; margin-bottom: 8px; }
-    .upload-hint { color: #64748b; font-size: 0.96rem; line-height: 1.6; }
+    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
     
-    /* ⭐️ [핵심 보완] 순정 파일 업로더 영역을 커스텀 드롭존 디자인으로 변딩 */
-    [data-testid="stFileUploader"] {
-        padding: 0 !important;
-        margin-top: 8px !important;
-    }
-    [data-testid="stFileUploaderDropzone"] {
-        background: #ffffff !important;
-        border: 2px dashed #93c5fd !important;
-        border-radius: 22px !important;
-        padding: 32px 16px !important;
-        text-align: center !important;
-    }
-    /* 내부 업로드 버튼 스타일 고도화 */
-    [data-testid="stFileUploaderDropzone"] button {
-        background-color: #eef4ff !important;
-        color: #1f4ed8 !important;
-        border: 1px solid #bfdbfe !important;
+    /* 카드 컨테이너 공통 가이드 */
+    .html-card { background: #ffffff; border-radius: 20px; padding: 20px; box-shadow: 0 10px 30px rgba(24, 39, 75, 0.04); border: 1px solid #e2e8f0; margin-bottom: 1rem; }
+    .app-title { font-size: 2.2rem; font-weight: 700; margin: 0; color: #102a43; }
+    .app-subtitle { color: #525f7f; font-size: 1rem; margin-top: 0.25rem; }
+    .section-label { display: inline-block; font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: #475569; margin-bottom: 0.5rem; }
+    .section-title { font-size: 1.25rem; font-weight: 700; color: #102a43; margin: 0; }
+    .upload-hint { color: #64748b; font-size: 0.9rem; line-height: 1.5; margin-top: 4px; }
+    .supported-file { background: #eef4ff; color: #1f4ed8; padding: 6px 12px; border-radius: 8px; display: inline-block; margin-right: 6px; font-weight: 600; font-size: 0.85rem; margin-top: 8px; }
+
+    /* 🔘 라디오 버튼 -> 세련된 가로형 세그먼트 제어 스위치 UI 구현 */
+    div[data-testid='stRadio'] > label { display: none !important; } 
+    div[data-testid='stRadio'] > div {
+        display: flex !important;
+        flex-direction: row !important;
+        background-color: #f1f5f9 !important;
         border-radius: 14px !important;
-        padding: 0.5rem 1rem !important;
-        font-weight: 600 !important;
+        padding: 4px !important;
+        gap: 6px !important;
+        margin-top: 5px !important;
+        border: 1px solid #e2e8f0 !important;
     }
-    [data-testid="stFileUploaderDropzone"] button:hover {
-        background-color: #dbeafe !important;
+    div[data-testid='stRadio'] label {
+        flex: 1 !important;
+        text-align: center !important;
+        padding: 10px 14px !important;
+        border-radius: 10px !important;
+        font-weight: 600 !important;
+        background: transparent !important;
+        color: #475569 !important;
+        cursor: pointer !important;
+        transition: all 0.2s ease !important;
+        border: none !important;
+    }
+    /* 라디오 버튼의 기본 동그라미 선택기 아이콘 강제 숨김 (유령 점 제거) */
+    div[data-testid='stRadio'] div[data-baseweb='radio'] > div:first-child {
+        display: none !important;
+    }
+    div[data-testid='stRadio'] label [data-testid='stMarkdownContainer'] {
+        margin-left: 0px !important;
+    }
+    div[data-testid='stRadio'] label:has(input:checked) {
+        background-color: #ffffff !important;
+        color: #1f4ed8 !important;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.08) !important;
+    }
+    div[data-testid='stRadio'] input[type='radio'] {
+        display: none !important;
     }
     
-    /* ⭐️ [추가] 사이드바 모드 선택을 토글 버튼 스타일로 변경 */
-    div[role="radiogroup"] {
-        display: flex;
-        background-color: #e2e8f0;
-        border-radius: 18px;
-        padding: 4px;
-        margin: 0.5rem 0 1rem 0;
+    [data-testid='stSidebar'] [data-testid='stFileUploader'] {
+        margin-top: 10px;
     }
-    div[role="radiogroup"] label { /* 각 라디오 옵션의 라벨 */
-        flex: 1;
-        text-align: center;
-        padding: 8px 0;
-        border-radius: 14px;
-        font-weight: 600;
-        font-size: 0.9rem;
-        cursor: pointer;
-        transition: all 0.2s ease-in-out;
-        color: #475569;
-    }
-    /* Streamlit 라디오 버튼의 기본 구조 `label > input` 을 이용 */
-    div[role="radiogroup"] label:has(input:checked) {
-        background-color: #ffffff;
-        color: #1f4ed8;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-    }
-    /* 실제 라디오 input 요소는 숨김 */
-    div[role="radiogroup"] input {
-        display: none;
-    }
-
-    /* ⭐️ [추가] 예상 질문 카드 스타일 */
-    .prediction-card {
-        background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 18px;
-        padding: 20px;
-        text-align: center;
-        cursor: pointer;
-        transition: all 0.2s ease-in-out;
-        height: 100%;
-    }
-    .prediction-card:hover {
-        transform: translateY(-4px);
-        box-shadow: 0 12px 24px rgba(31, 78, 216, 0.1);
-        border-color: #bfdbfe;
-    }
-    .prediction-card-selected {
-        background: #eef4ff;
-        border-color: #1d4ed8;
-        transform: translateY(-4px);
-        box-shadow: 0 12px 24px rgba(31, 78, 216, 0.1);
-    }
-    .prediction-question {
-        font-weight: 600;
-        color: #1e293b;
-        font-size: 1rem;
-        margin: 0;
-    }
-
-    .stButton>button { border-radius: 999px; padding: 0.95rem 1.35rem; font-weight: 600; }
-    .stTextInput>div>div>input { border-radius: 14px; }
-    .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 { color: #102a43; }
 </style>
 """
 
-# 상단 헤더 영역 (Base64로 인코딩된 요정 이미지를 src에 주입하세요)
-MAIN_HEADER_HTML = r"""
-<div style="display:flex; align-items:center; gap: 1.5rem; margin-bottom: 1.5rem;">
-  <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" width="80">
-  <div>
-    <p class="app-title">문서 요정과 대화해보세요!</p>
-    <p class="app-subtitle">필요에 따라 고정된 로컬 DB를 선택하거나 새로운 파일을 직접 업로드하여 대화할 수 있습니다.</p>
-  </div>
-</div>
-"""
-
-# 사이드바 모드 설정 헤더
-SIDEBAR_MODE_HEADER_HTML = r"""
-<div class="page-card" style="padding: 20px; margin-bottom: 15px;">
-  <div class="section-label">MODE SELECT</div>
-  <div class="section-title" style="font-size: 1.15rem; margin: 0;">🤖 챗봇 모드 설정</div>
-</div>
-"""
-
-# [모드 A] 고정 문서 DB (Chroma) 카드 (잘려 보이던 가짜 업로드 디자인 제거)
-SIDEBAR_CHROMA_HTML = r"""
-<div class="page-card" style="border-radius: 24px; padding: 24px; box-shadow: 0 10px 40px rgba(24, 39, 75, 0.04); margin-bottom: 0;">
-  <div class="section-label">STEP 1</div>
-  <div class="section-title">💾 고정 로컬 DB 로드</div>
-  <p class="upload-hint">ingest.py를 통해 로컬에 구축된 chroma_db 스토리지를 불러옵니다.</p>
-  <div class="panel-divider"></div>
-</div>
-"""
-
-# [모드 B] 실시간 파일 업로드 카드 (잘려 보이던 가짜 업로드 디자인 제거)
-SIDEBAR_UPLOAD_HTML = r"""
-<div class="page-card" style="border-bottom-left-radius: 0; border-bottom-right-radius: 0; box-shadow: 0 10px 40px rgba(24, 39, 75, 0.04); margin-bottom: 0; border-bottom: none;">
-  <div class="section-label">STEP 1</div>
-  <div class="section-title">📂 실시간 문서 업로드</div>
-  <p class="upload-hint">새로운 PDF 또는 TXT 문서를 추가하여 즉석에서 분석합니다.</p>
-  <div class="panel-divider"></div>
-  <div class="section-card">
-    <div class="section-subtitle">지원되는 파일 형식</div>
-    <div class="supported-file">.pdf</div>
-    <div class="supported-file">.txt</div>
-  </div>
-  <div style="margin-top: 20px; font-size: 0.95rem; font-weight: 600; color: #0f172a;">업로드</div>
-</div>
-"""
-
-# 사이드바 하단 STEP 2 카드
-SIDEBAR_STEP2_HTML = r"""
-<div class="page-card" style="padding: 20px; margin-top: 15px;">
-  <div class="section-label">STEP 2</div>
-  <div class="section-title" style="font-size: 1.15rem; margin-bottom: 4px;">🔎 실시간 대화 가능</div>
-  <p class="upload-hint">현재 선택된 모드의 데이터를 바탕으로 요정과 자유롭게 질의응답을 나눕니다.</p>
-</div>
-"""
+# 글로벌 CSS 주입
 st.markdown(CSS_STYLE, unsafe_allow_html=True)
 
 # =========================================================================
-# ⭐️ [핵심 추가] 예상 질문 클릭 처리 로직
+# 🧚 [자동 감지] 로컬 fairy.gif 파일을 Base64 변환하여 상단 헤더에 바인딩
 # =========================================================================
-# URL 쿼리 파라미터를 사용하여 클릭 상태를 관리하고, 클릭 시 채팅 메시지를 추가합니다.
-params = st.query_params
-if "select_prediction" in params:
-    new_index_str = params.get("select_prediction")
-    # 이전에 클릭한 질문과 다른 질문을 클릭했을 때만 채팅 기록에 추가
-    if st.session_state.get("selected_prediction_index") != new_index_str:
-        st.session_state.selected_prediction_index = new_index_str
+def get_fairy_image_src():
+    default_butterfly_url = "https://cdn.pixabay.com/photo/2021/04/24/11/04/butterfly-6203716_1280.png"
+    local_image_name = "fairy.gif"
+    if os.path.exists(local_image_name):
         try:
-            index = int(new_index_str)
-            # 미리 생성해둔 Q&A 세트를 가져와 채팅 기록에 추가
-            qa_pair = st.session_state.qa_predictions[index]
-            st.session_state.messages.append({"role": "user", "content": qa_pair["question"]})
-            st.session_state.messages.append({"role": "assistant", "content": qa_pair["answer"]})
-            st.rerun() # 채팅 기록을 즉시 업데이트하기 위해 재실행
-        except (ValueError, IndexError, TypeError):
-            # 잘못된 인덱스나 데이터가 없는 경우 무시
-            st.session_state.selected_prediction_index = None
+            with open(local_image_name, "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                return f"data:image/gif;base64,{encoded_string}"
+        except Exception:
+            return default_butterfly_url
+    return default_butterfly_url
 
-# 화면 구성 시작
-st.markdown(MAIN_HEADER_HTML, unsafe_allow_html=True)
+fairy_img_src = get_fairy_image_src()
 
-# 세션 상태 초기화
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "local_vector_store" not in st.session_state:
-    st.session_state.local_vector_store = None
-if "previous_mode" not in st.session_state:
-    st.session_state.previous_mode = "📌 고정 문서 DB (chroma_db)"
-if "qa_predictions" not in st.session_state:
-    st.session_state.qa_predictions = None
-if "selected_prediction_index" not in st.session_state:
-    st.session_state.selected_prediction_index = None
-if "last_uploaded_name" not in st.session_state:
-    st.session_state.last_uploaded_name = None
-if "active_store" not in st.session_state:
-    st.session_state.active_store = None
+# 최상단 앱 타이틀 영역
+st.markdown(f"""
+<div class="html-card" style="display:flex; align-items:center; gap: 1.5rem;">
+  <img src="{fairy_img_src}" width="65" height="65" style="object-fit: contain; border-radius: 12px;">
+  <div>
+    <p class="app-title">문서 요정 RAG 챗봇 2.0</p>
+    <p class="app-subtitle">고정 로컬 DB 또는 실시간 업로드 문서를 다각도로 분석하여 지능형 답변을 제공합니다.</p>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-# 임베딩 모델 정의
+# 세션 상태(Session State) 독립 초기화
+if "messages" not in st.session_state: st.session_state.messages = []
+if "local_vector_store" not in st.session_state: st.session_state.local_vector_store = None
+if "upload_vector_store" not in st.session_state: st.session_state.upload_vector_store = None
+if "suggestions" not in st.session_state: st.session_state.suggestions = None
+if "selected_query" not in st.session_state: st.session_state.selected_query = None
+if "previous_mode" not in st.session_state: st.session_state.previous_mode = "📌 고정 문서 DB (chroma_db)"
+
+# 공유 객체 및 RAG 모델 파라미터 정의
 embeddings_model = OpenAIEmbeddings(model="text-embedding-3-small")
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+# 🧠 AI 예상 질문 리스트 추출 알고리즘
+def generate_suggestions(vector_store):
+    fallback_list = [
+        {"q": "이 문서의 전반적인 핵심 요약은 무엇인가요?", "a": "문서의 핵심 주제와 흐름을 요약해 드립니다. 궁금한 상세 사항을 편하게 질문해 주세요!"},
+        {"q": "문서에서 가장 중요하게 다뤄지는 요점은 무엇인가요?", "a": "자료 내에서 비중이 높게 다뤄지는 핵심 지표나 가이드라인을 집중 분석하여 답변을 도출합니다."}
+    ]
+    try:
+        base_retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+        docs = base_retriever.invoke("핵심 내용 전체 요약 요점 가이드")
+        context = format_docs(docs) if docs else "데이터 없음"
+        
+        prompt = PromptTemplate.from_template(
+            "Context 정보를 분석하여 사용자가 질문할 만한 가치 있는 예상 질문 2개와 그에 대한 정확한 답변 쌍을 작성하세요.\n"
+            "반드시 다른 사족 내용 없이 오직 아래 지정된 JSON 배열 포맷 형태로만 정확히 응답해야 합니다.\n\n"
+            "[\n"
+            "  {{\"q\": \"예상 질문 내용 1\", \"a\": \"질문에 대한 핵심 답변 내용 1\"}},\n"
+            "  {{\"q\": \"예상 질문 내용 2\", \"a\": \"질문에 대한 핵심 답변 내용 2\"}}\n"
+            "]\n\n"
+            "Context: {context}"
+        )
+        
+        chain = prompt | llm | StrOutputParser()
+        res = chain.invoke({"context": context}).strip()
+        
+        if "```json" in res:
+            res = res.split("```json")[1].split("```")[0].strip()
+        elif "```" in res:
+            res = res.split("```")[1].split("```")[0].strip()
+            
+        suggestions = json.loads(res)
+        if isinstance(suggestions, list) and len(suggestions) > 0:
+            return suggestions
+        return fallback_list
+    except Exception:
+        return fallback_list
+
+# =========================================================================
+# 🎛️ 사이드바 컨트롤 영역
+# =========================================================================
 with st.sidebar:
-    st.markdown(SIDEBAR_MODE_HEADER_HTML, unsafe_allow_html=True)
-    # ⭐️ [수정] Selectbox를 가로형 Radio 버튼으로 변경하여 토글처럼 보이게 함
-    chat_mode = st.radio(
-        "사용할 데이터 소스를 골라주세요.",
-        ["📌 고정 문서 DB (chroma_db)", "📂 실시간 파일 업로드"],
-        label_visibility="collapsed",
-        horizontal=True,
-    )
+    st.markdown('<div class="html-card"><div class="section-label">MODE SELECT</div><div class="section-title">🤖 챗봇 모드 설정</div></div>', unsafe_allow_html=True)
+    chat_mode = st.radio("모드 선택", ["📌 고정 문서 DB (chroma_db)", "📂 실시간 파일 업로드"], label_visibility="collapsed")
     
     if chat_mode != st.session_state.previous_mode:
         st.session_state.messages = []
+        st.session_state.suggestions = None
+        st.session_state.selected_query = None
         st.session_state.previous_mode = chat_mode
-        # ⭐️ [수정] 모드 변경 시, 이전 모드의 예상 질문이 남아있지 않도록 초기화합니다.
-        st.session_state.qa_predictions = None
-        st.session_state.selected_prediction_index = None
         st.rerun()
 
-    # 모드에 따른 활성 벡터 저장소(active_store) 결정
     active_store = None
 
-    # [모드 A] 고정 문서 DB (Chroma)
     if chat_mode == "📌 고정 문서 DB (chroma_db)":
-        st.markdown(SIDEBAR_CHROMA_HTML, unsafe_allow_html=True)
+        st.markdown('<div class="html-card"><div class="section-label">STEP 1</div><div class="section-title">💾 고정 로컬 DB 로드</div><p class="upload-hint">ingest.py를 통해 로컬 디스크에 구축된 chroma_db 스토리지를 직접 연동합니다.</p></div>', unsafe_allow_html=True)
         if os.path.exists("./chroma_db"):
             if st.session_state.local_vector_store is None:
-                st.session_state.local_vector_store = Chroma(
-                    persist_directory="./chroma_db",
-                    embedding_function=embeddings_model
-                )
-            st.success("✅ 로컬 chroma_db 폴더 연결 완료!")
+                st.session_state.local_vector_store = Chroma(persist_directory="./chroma_db", embedding_function=embeddings_model)
+            st.success("✅ 로컬 chroma_db 폴더 연결 성공!")
+            active_store = st.session_state.local_vector_store
         else:
-            st.error("❌ 로컬 DB가 없습니다. 먼저 python ingest.py를 실행해 주세요.")
-        st.session_state.active_store = st.session_state.local_vector_store
-
-    # [모드 B] 실시간 파일 업로드
+            st.error("❌ 로컬 DB가 없습니다. python ingest.py를 먼저 돌려주세요.")
     else:
-        st.markdown(SIDEBAR_UPLOAD_HTML, unsafe_allow_html=True)
+        st.markdown('<div class="html-card" style="margin-bottom:0.5rem;"><div class="section-label">STEP 1</div><div class="section-title">📂 실시간 문서 업로드</div><p class="upload-hint">새로운 PDF 또는 TXT 문서를 추가하여 세션용 데이터 세트를 즉석 빌드합니다.</p><div class="supported-file">.pdf</div><div class="supported-file">.txt</div></div>', unsafe_allow_html=True)
+        uploaded_file = st.file_uploader("파일 업로드 위젯", type=["pdf", "txt"], accept_multiple_files=False, label_visibility="collapsed")
         
-        # ⭐️ [핵심 보완] 잘려 보이던 가짜 HTML 태그를 지우고, 이 자리에 실제 기능하는 업로더를 삽입
-        # label_visibility="collapsed" 옵션으로 지저분한 기본 타이틀 텍스트를 숨겨 카드와 일체화시킵니다.
-        uploaded_file = st.file_uploader(
-            "문서 파일 업로드",
-            type=["pdf", "txt"],
-            accept_multiple_files=False,
-            label_visibility="collapsed"
-        )
-        
-        # 새로운 파일이 감지되면 동적 임베딩 수행
         if uploaded_file is not None:
-            if st.session_state.last_uploaded_name != uploaded_file.name:
+            if st.session_state.get("last_uploaded_name") != uploaded_file.name:
                 with st.spinner("문서를 실시간으로 분석하는 중... ✨"):
                     file_name = uploaded_file.name
                     docs = []
@@ -287,157 +222,93 @@ with st.sidebar:
                     elif file_name.endswith('.pdf'):
                         pdf_reader = pypdf.PdfReader(uploaded_file)
                         text = ""
-                        for page in pdf_reader.pages:
-                            text += page.extract_text() or ""
+                        for page in pdf_reader.pages: text += page.extract_text() or ""
                         docs.append(Document(page_content=text, metadata={"source": file_name}))
 
                     text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=20)
                     splits = text_splitter.split_documents(docs)
 
-                    # 실시간 업로드는 Chroma를 메모리에서 사용
-                    st.session_state.active_store = Chroma.from_documents(
-                        documents=splits, embedding=embeddings_model
-                    )
+                    st.session_state.upload_vector_store = InMemoryVectorStore.from_documents(splits, embedding=embeddings_model)
                     st.session_state.last_uploaded_name = uploaded_file.name
-                    st.session_state.qa_predictions = None # 새 파일이므로 예측 초기화
-                    st.session_state.selected_prediction_index = None
-                    st.success("✅ 임시 파일 분석 완료!")
+                    st.session_state.suggestions = None
+                    st.rerun()
+            active_store = st.session_state.upload_vector_store
         else:
-            st.session_state.active_store = None
+            st.session_state.upload_vector_store = None
             st.session_state.last_uploaded_name = None
-            
-    st.markdown(SIDEBAR_STEP2_HTML, unsafe_allow_html=True)
+            if st.session_state.suggestions is not None:
+                st.session_state.suggestions = None
+                st.session_state.selected_query = None
+                st.rerun()
 
-active_store = st.session_state.get('active_store')
+    st.markdown('<div class="html-card" style="margin-top:10px;"><div class="section-label">STEP 2</div><div class="section-title">🔎 실시간 대화 상태</div><p class="upload-hint">데이터 소스가 동기화되어 실시간 응답이 준비되었습니다.</p></div>', unsafe_allow_html=True)
+
+# 💡 자원 분석 로직 트리거
+if active_store is not None and st.session_state.suggestions is None:
+    st.session_state.suggestions = generate_suggestions(active_store)
+    st.rerun()
 
 # =========================================================================
-# ⭐️ [핵심 추가] 활성 문서 기반으로 예상 Q&A 생성
+# 💬 메인 우측 뷰어 및 질의응답 처리 영역
 # =========================================================================
-if active_store and st.session_state.qa_predictions is None:
-    with st.spinner("문서 내용을 기반으로 예상 질문과 답변을 생성하는 중... 🔮"):
-        retriever = active_store.as_retriever(search_kwargs={"k": 5})
-        docs = retriever.invoke("이 문서의 주요 내용에 대한 질문과 답변 쌍을 만들어줘.")
-        context_text = "\n\n".join(doc.page_content for doc in docs)
+st.markdown(f'<div class="html-card" style="border-left: 5px solid #1f4ed8; background: #f8faff; font-weight:600;">현재 활성화 모드: {chat_mode}</div>', unsafe_allow_html=True)
 
-        if context_text.strip():
-            qa_gen_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
-            qa_gen_prompt_template = """
-            You are a helpful assistant who analyzes a given context and creates two relevant questions and answers based on it.
-            Provide the output as a valid JSON list of objects, where each object has a "question" key and an "answer" key.
-            Example: [{"question": "What is the main topic?", "answer": "The main topic is..."}, {"question": "Who is the author?", "answer": "The author is..."}]
-
-            Context:
-            {context}
-            """
-            qa_gen_prompt = PromptTemplate.from_template(qa_gen_prompt_template)
-            qa_gen_chain = qa_gen_prompt | qa_gen_llm | SimpleJsonOutputParser()
-            try:
-                st.session_state.qa_predictions = qa_gen_chain.invoke({"context": context_text})
-            except Exception:
-                st.session_state.qa_predictions = [] # 파싱 오류 시 빈 리스트로 처리
-        else:
-            st.session_state.qa_predictions = []
-
-
-# 메인 UI 레이아웃
-st.markdown(f'<div class="page-card" style="border-left: 5px solid #1f4ed8; background: #f8faff; padding: 16px;"><span style="font-weight:700; color:#1f4ed8;">현재 활성화된 모드:</span> {chat_mode}</div>', unsafe_allow_html=True)
-
-# ⭐️ [핵심 추가] 예상 질문 카드 UI
-# ⭐️ [수정] 질문 목록이 실제로 있을 때만 UI를 그리도록 길이를 확인하는 방어 코드 추가
-if st.session_state.get("qa_predictions") and len(st.session_state.qa_predictions) > 0:
-    st.markdown(
-        """
-        <div class="page-card" style="margin-top: 1.5rem; padding-bottom: 16px;">
-          <div class="section-label">SUGGESTED QUESTIONS</div>
-          <div class="section-title">💡 AI가 추천하는 예상 질문</div>
-          <p class="upload-hint">아래 카드를 클릭하면 미리 생성된 답변을 바로 확인할 수 있습니다.</p>
-          <div style="margin-top: 1rem;"></div>
-        """,
-        unsafe_allow_html=True
-    )
-    cols = st.columns(len(st.session_state.qa_predictions))
-    for i, qa in enumerate(st.session_state.qa_predictions):
+# ⭐️ 예상 질문 영역 배치 및 선택 시 컬러 커스텀 스위칭
+if st.session_state.suggestions:
+    st.write("💡 **AI 추천 핵심 질문 (클릭 시 하단 대화창에 즉시 정답 로드)**")
+    cols = st.columns(2)
+    for i, item in enumerate(st.session_state.suggestions):
         with cols[i]:
-            is_selected_class = "prediction-card-selected" if str(i) == st.session_state.get("selected_prediction_index") else ""
-            st.markdown(
-                f"""
-                <a href="?select_prediction={i}" target="_self" style="text-decoration: none;">
-                    <div class="prediction-card {is_selected_class}">
-                        <p class="prediction-question">{qa['question']}</p>
-                    </div>
-                </a>""", unsafe_allow_html=True
-            )
-    st.markdown("</div>", unsafe_allow_html=True) # page-card div 닫기
+            is_selected = (st.session_state.selected_query == item['q'])
+            btn_type = "primary" if is_selected else "secondary"
+            button_text = f"📌 {item['q']}" if is_selected else item['q']
+            
+            if st.button(button_text, key=f"suggest_btn_{i}", use_container_width=True, type=btn_type):
+                st.session_state.selected_query = item['q']
+                st.session_state.messages.append({"role": "user", "content": item['q']})
+                st.session_state.messages.append({"role": "assistant", "content": item['a']})
+                st.rerun()
 
-st.markdown(
-    r"""
-    <div class="page-card">
-      <div class="section-label">CHAT</div>
-      <div class="section-title">💬 문서 요정과 대화하기 (Multi-Query 작동 중)</div>
-      <p class="upload-hint">질문을 입력하면 AI 비서가 다각도로 질문을 재해석하여 정확한 정보를 찾아냅니다.</p>
-      <div class="panel-divider"></div>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown('<div class="html-card" style="margin-top:15px; margin-bottom:5px;"><div class="section-label">CHAT</div><div class="section-title">💬 문서 요정과 대화하기 (Multi-Query 작동 중)</div></div>', unsafe_allow_html=True)
 
-if not st.session_state.messages and not st.session_state.get("qa_predictions"):
+if not st.session_state.messages:
     if chat_mode == "📌 고정 문서 DB (chroma_db)":
-        st.info("고정 문서 로드가 완료되었습니다. 아래 대화창에 바로 질문을 입력하세요!")
+        st.info("고정 아카이브 문서가 완벽하게 연결되었습니다. 아래 입력창에 질문을 작성하거나 위의 추천 질문을 눌러보세요!")
     else:
-        st.info("왼쪽 사이드바 카드 영역에 PDF 또는 TXT 문서를 업로드해 주시면 대화가 시작됩니다.")
+        st.info("실시간 업로드 모드입니다. 왼쪽 탐색기에서 파일을 업로드하시면 즉시 가동됩니다.")
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-st.markdown(r"""<div class="panel-divider"></div></div>""", unsafe_allow_html=True)
-
-# 사용자 질문 입력 및 핵심 로직 처리
-if user_query := st.chat_input("선택한 문서 소스에 대해 궁금한 점을 물어보세요!"):
-    # 사용자가 직접 질문을 입력하면, 선택된 예상 질문 상태는 초기화
-    st.session_state.selected_prediction_index = None
-
+# 질문 처리 인터페이스
+if user_query := st.chat_input("문서 내용에 기반해 질문을 던져보세요!"):
+    st.session_state.selected_query = None
     with st.chat_message("user"):
         st.markdown(user_query)
     st.session_state.messages.append({"role": "user", "content": user_query})
 
     with st.chat_message("assistant"):
         if active_store is None:
-            if chat_mode == "📌 고정 문서 DB (chroma_db)":
-                response_text = "로컬 디스크에 생성된 `chroma_db` 폴더를 찾을 수 없습니다. `python ingest.py`를 먼저 실행해 주세요."
-            else:
-                response_text = "먼저 왼쪽 업로드 카드 영역에서 문서를 드래그하여 업로드해 주세요. 📂"
-            st.markdown(response_text)
+            st.warning("참조할 수 있는 데이터가 없습니다.")
         else:
-            with st.spinner("요정이 다각도로 질문을 분석하여 문서를 검색하고 있습니다... 💭"):
-                # 기본 검색기 빌드
-                retriever = active_store.as_retriever(search_kwargs={"k": 3})
-                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=512)
-
-                # 제시해주신 프롬프트 가이드 반영
-                system_prompt = (
-                    "너는 질문-답변을 돕는 유능한 비서야. "
-                    "아래 제공된 맥락(context)만을 사용하여 질문에 답해줘. "
-                    "답을 모르면 모른다고 하고, 절대 답변을 지어내지 마.\n\n"
-                    "Context:\n{context}"
-                )
+            with st.spinner("요정이 문서를 탐색하고 있습니다... 💭"):
+                base_retriever = active_store.as_retriever(search_kwargs={"k": 3})
+                retriever = MultiQueryRetriever.from_llm(retriever=base_retriever, llm=llm)
+                
                 prompt = ChatPromptTemplate.from_messages([
-                    ("system", system_prompt),
+                    ("system", "주어진 문맥(Context)만을 사용하여 답변하세요. 모르면 모른다고 하세요.\n\nContext:\n{context}"),
                     ("human", "{input}"),
                 ])
-
-                def format_docs(docs):
-                    return "\n\n".join(doc.page_content for doc in docs)
-
-                # 순수 LCEL 파이프라인 구조 유지로 에러 차단
+                
                 rag_chain = (
                     {"context": retriever | format_docs, "input": RunnablePassthrough()}
                     | prompt
                     | llm
                     | StrOutputParser()
                 )
-
+                
                 response_text = rag_chain.invoke(user_query)
                 st.markdown(response_text)
-
-    st.session_state.messages.append({"role": "assistant", "content": response_text})
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
+    st.rerun()
